@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import glob
 import io
-import json
 import math
 import os
 import random
@@ -33,13 +32,7 @@ from dynamic_data import (
     load_validation_tokens_from_raw,
 )
 from telemetry import TelemetryBuffer
-from velocity import (
-    FIRST_DYNAMIC_TOKEN_ID,
-    PanicPredictions,
-    VelocityTracker,
-    resolve_static_core_ids,
-    write_phase_space_snapshot,
-)
+from velocity import FIRST_DYNAMIC_TOKEN_ID, VelocityTracker, resolve_static_core_ids, write_phase_space_snapshot
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -81,12 +74,6 @@ class Hyperparameters:
     velocity_panic_quantile = float(os.environ.get("VELOCITY_PANIC_QUANTILE", "0.75"))
     velocity_work_quantile = float(os.environ.get("VELOCITY_WORK_QUANTILE", "0.75"))
     velocity_work_floor_quantile = float(os.environ.get("VELOCITY_WORK_FLOOR_QUANTILE", "0.25"))
-    panic_predictions_enabled = bool(int(os.environ.get("PANIC_PREDICTIONS_ENABLED", "0")))
-    panic_predictions_threshold = float(os.environ.get("PANIC_PREDICTIONS_THRESHOLD", "2.0"))
-    panic_predictions_top_k = int(os.environ.get("PANIC_PREDICTIONS_TOP_K", "5"))
-    panic_predictions_start_step = int(os.environ.get("PANIC_PREDICTIONS_START_STEP", "0"))
-    panic_predictions_snapshot_path = os.environ.get("PANIC_PREDICTIONS_SNAPSHOT_PATH", "")
-    velocity_dump_every = int(os.environ.get("VELOCITY_DUMP_EVERY", "0"))
     static_core_vocab_path = os.environ.get(
         "STATIC_CORE_VOCAB_PATH",
         str(Path(__file__).resolve().parents[1] / "data" / "vocabularies" / "vocabulary_beta_1.0.json"),
@@ -756,7 +743,6 @@ class GPT(nn.Module):
         target_ids: Tensor,
         return_per_position: bool = False,
         capture_velocity: bool = False,
-        return_logits: bool = False,
     ):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -781,7 +767,6 @@ class GPT(nn.Module):
             else:
                 x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        bsz, seqlen_out = target_ids.shape
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -793,18 +778,13 @@ class GPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss_per_pos = F.cross_entropy(logits.float(), targets, reduction="none").reshape_as(target_ids)
         loss = loss_per_pos.mean()
-
-        vel_stack = torch.stack(velocity_maps, dim=0) if capture_velocity else None
-        logits_out = logits.detach().reshape(bsz, seqlen_out, -1) if return_logits else None
-
-        results = [loss]
+        if return_per_position and capture_velocity:
+            return loss, loss_per_pos, torch.stack(velocity_maps, dim=0)
         if return_per_position:
-            results.append(loss_per_pos)
+            return loss, loss_per_pos
         if capture_velocity:
-            results.append(vel_stack)
-        if return_logits:
-            results.append(logits_out)
-        return results[0] if len(results) == 1 else tuple(results)
+            return loss, torch.stack(velocity_maps, dim=0)
+        return loss
 
 
 # -----------------------------
@@ -816,7 +796,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    # torch.compile disabled on Windows (no Triton backend)
+    pass
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -848,8 +829,8 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -941,11 +922,6 @@ def main() -> None:
         )
     else:
         log0("velocity:disabled")
-    if args.panic_predictions_enabled and args.velocity_enabled:
-        log0(
-            f"panic_predictions:enabled threshold:{args.panic_predictions_threshold} "
-            f"top_k:{args.panic_predictions_top_k} start_step:{args.panic_predictions_start_step}"
-        )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -964,11 +940,22 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+    # Warm-start embeddings: bypass the crystallization plateau
+    warm_embed_path = os.environ.get("WARM_EMBEDDINGS", "")
+    if warm_embed_path and os.path.isfile(warm_embed_path):
+        warm_emb = torch.load(warm_embed_path, map_location=device, weights_only=True)
+        assert warm_emb.shape == base_model.tok_emb.weight.shape, (
+            f"Warm embedding shape {warm_emb.shape} != model {base_model.tok_emb.weight.shape}"
+        )
+        with torch.no_grad():
+            base_model.tok_emb.weight.copy_(warm_emb.to(base_model.tok_emb.weight.dtype))
+        log0(f"warm_start:loaded {warm_embed_path} shape={warm_emb.shape}")
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # torch.compile disabled on Windows (no Triton backend)
+    compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1072,14 +1059,6 @@ def main() -> None:
         if args.velocity_enabled
         else None
     )
-    panic_predictor = (
-        PanicPredictions(
-            top_k=args.panic_predictions_top_k,
-            panic_threshold=args.panic_predictions_threshold,
-        )
-        if args.panic_predictions_enabled and args.velocity_enabled
-        else None
-    )
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1171,28 +1150,6 @@ def main() -> None:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
-        # Periodic phase-space dump for maturation trajectory
-        if (
-            velocity_tracker is not None
-            and args.velocity_dump_every > 0
-            and step % args.velocity_dump_every == 0
-            and step > 0
-            and master_process
-        ):
-            velocity_tracker.flush()
-            dump_path = f"logs/{args.run_id}_phase_space_step_{step:05d}.json"
-            write_phase_space_snapshot(
-                dump_path,
-                velocity_tracker,
-                vocabulary_json_path=args.static_core_vocab_path,
-                static_core_ids=static_core_ids,
-                min_observations=args.velocity_min_observations,
-                panic_quantile=args.velocity_panic_quantile,
-                work_quantile=args.velocity_work_quantile,
-                work_floor_quantile=args.velocity_work_floor_quantile,
-            )
-            log0(f"velocity_dump:step={step} path={dump_path}")
-
         if last_step:
             if stop_after_step is not None and step < args.iterations:
                 log0(
@@ -1221,31 +1178,15 @@ def main() -> None:
                 and args.velocity_every > 0
                 and (step + 1) % args.velocity_every == 0
             )
-            capture_panic = (
-                capture_velocity
-                and panic_predictor is not None
-                and (step + 1) >= args.panic_predictions_start_step
-            )
-            # Use uncompiled base_model for velocity/logits capture (torch.compile
-            # with fullgraph=True can't handle the conditional return shape).
-            fwd = base_model if capture_velocity else model
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 if telemetry is not None and capture_velocity:
-                    result = fwd(
-                        x, y, return_per_position=True, capture_velocity=True,
-                        return_logits=capture_panic,
+                    loss, loss_per_pos, velocity_map = model(
+                        x, y, return_per_position=True, capture_velocity=True
                     )
-                    loss, loss_per_pos, velocity_map = result[0], result[1], result[2]
-                    panic_logits = result[3] if capture_panic else None
                 elif telemetry is not None:
                     loss, loss_per_pos = model(x, y, return_per_position=True)
                 elif capture_velocity:
-                    result = fwd(x, y, capture_velocity=True, return_logits=capture_panic)
-                    if capture_panic:
-                        loss, velocity_map, panic_logits = result
-                    else:
-                        loss, velocity_map = result
-                        panic_logits = None
+                    loss, velocity_map = model(x, y, capture_velocity=True)
                 else:
                     loss = model(x, y)
             train_loss += loss.detach()
@@ -1253,8 +1194,6 @@ def main() -> None:
                 telemetry.enqueue(x, loss_per_pos)
             if capture_velocity:
                 velocity_tracker.enqueue(x, velocity_map)
-            if capture_panic and panic_logits is not None:
-                panic_predictor.record(x, velocity_map, panic_logits)
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
@@ -1383,19 +1322,6 @@ def main() -> None:
             )
             log0(f"coherence_top_tokens:{top_summary}")
         log0(f"coherence_snapshot_path:{snapshot_path}")
-
-    if panic_predictor is not None and master_process:
-        snap = panic_predictor.snapshot()
-        snap_path = args.panic_predictions_snapshot_path or f"logs/{args.run_id}_panic_predictions.json"
-        Path(snap_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(snap_path, "w", encoding="utf-8") as f:
-            json.dump(snap, f, indent=2)
-        log0(
-            f"panic_predictions:"
-            f" tokens_tracked={snap['total_tokens_tracked']}"
-            f" total_events={snap['total_panic_events']}"
-        )
-        log0(f"panic_predictions_path:{snap_path}")
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
